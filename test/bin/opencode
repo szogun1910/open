@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+echo "FAKE-OC: $*" >> "$TESTLOG"
+case "$1" in
+  --version) echo "0.14.8" ;;
+  models)
+    printf 'opencode/deepseek-v4-flash-free\nopencode/mimo-v2.5-free\nopencode/hy3-free\nopencode/gpt-5-nano\nanthropic/claude-sonnet-4\n'
+    ;;
+  run)
+    n=$(cat "$COUNTER" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$COUNTER"
+    lim=$(cat "$LIMIT_UNTIL" 2>/dev/null || echo 0)
+    if [ "$n" -le "$lim" ]; then
+      echo "Error: FreeUsageLimitError: Free usage exceeded for this IP"; exit 1
+    fi
+    case "$(cat "$MODE" 2>/dev/null)" in
+      dash429) echo "Znalazlem: serwer zwrocil kod 429 w logach. Naprawione." ; exit 0;;
+      hang) echo "starting long task"; sleep 25; echo "done"; exit 0;;
+      orphan) ( sleep 25 & echo $! > /tmp/child.pid; wait ); exit 0;;
+      fail) echo "Error: connection reset by peer"; exit 1;;
+    esac
+    echo "ANSWER OK on attempt $n with: $*"; exit 0
+    ;;
+esac

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+echo "FAKE-MULLVAD: $*" >> "$TESTLOG"
+case "$1 $2" in
+  "--version ") echo "mullvad-cli 2026.1" ;;
+  "status ") cat "$MULLVAD_STATUS" 2>/dev/null || echo "Connected to se-got-wg-001" ;;
+  "relay list") printf 'Country: Sweden\n  Gothenburg (got)\n    se-got-wg-001  active 1000 Mbps\n    se-got-wg-002  active 1000 Mbps\nCountry: Poland\n  Warsaw (waw)\n    pl-waw-wg-001  active 1000 Mbps\n' ;;
+  "relay set") exit 0 ;;
+  "reconnect ") exit 0 ;;
+  "tunnel set") exit 0 ;;
+esac
+exit 0
