@@ -247,9 +247,10 @@ get_ip() { curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true; }
 # ─────────────────────────── ROTACJA ────────────────────────────────
 
 # [FIX-8] pamięć ostatnich relayów — `shuf -n1` potrafił wylosować ten sam
-# serwer dwa razy z rzędu, czyli "rotacja" bez rotacji.
-RELAY_SEEN_FILE="$RUN_DIR/relays-used"
-: >"$RELAY_SEEN_FILE" 2>/dev/null || true
+# serwer dwa razy z rzędu, czyli "rotacja" bez rotacji. Plik jest TRWAŁY
+# (w 1.2.0 nie istniał wcale), bo `oc-hop` to osobny proces na każdy obrót.
+RELAY_SEEN_FILE="${RELAY_SEEN_FILE:-$RUN_DIR/relays-used}"
+touch "$RELAY_SEEN_FILE" 2>/dev/null || true
 
 mullvad_relays() {
   timeout 25 mullvad relay list 2>/dev/null \
@@ -263,13 +264,31 @@ pick_relay() {
   mapfile -t all < <(mullvad_relays)
   (( ${#all[@]} )) || return 1
   mapfile -t used < <(tail -n "$RELAY_COOLDOWN" "$RELAY_SEEN_FILE" 2>/dev/null)
+
   for r in "${all[@]}"; do
     local skip=0 u
     for u in ${used+"${used[@]}"}; do [[ "$r" == "$u" ]] && skip=1; done
     (( skip )) || fresh+=("$r")
   done
-  (( ${#fresh[@]} )) || fresh=("${all[@]}")
-  printf '%s\n' "${fresh[@]}" | shuf -n1
+  if (( ${#fresh[@]} )); then
+    printf '%s\n' "${fresh[@]}" | shuf -n1
+    return 0
+  fi
+
+  # pula mniejsza niż RELAY_COOLDOWN: wszystko było użyte, więc bierzemy
+  # ten użyty NAJDAWNIEJ (LRU) zamiast losować — w 1.2.0 `shuf -n1` potrafił
+  # wylosować dokładnie ten sam serwer, na którym właśnie skończyliśmy.
+  local tmp oldest="" i
+  tmp="$(mktemp "${TMPDIR:-/tmp}/oc-rotate-lru.XXXXXX")"
+  for r in "${all[@]}"; do
+    i="$(grep -nx -- "$r" "$RELAY_SEEN_FILE" 2>/dev/null | tail -1 | cut -d: -f1)"
+    [[ -z "$i" ]] && i=0
+    printf '%s %s\n' "$i" "$r" >>"$tmp"
+  done
+  oldest="$(sort -n -k1,1 "$tmp" | head -1 | cut -d' ' -f2-)"
+  rm -f "$tmp"
+  [[ -n "$oldest" ]] && { printf '%s\n' "$oldest"; return 0; }
+  printf '%s\n' "${all[@]}" | shuf -n1
 }
 
 # [FIX-8] `mullvad reconnect` wraca od razu, tunel dopiero się spina.
@@ -297,6 +316,11 @@ rotate_mullvad() {
   }
   log "mullvad -> ${C_B}$host${C_0}"
   printf '%s\n' "$host" >>"$RELAY_SEEN_FILE" 2>/dev/null || true
+  # historia tylko do celów cooldownu — nie ma rosnąć w nieskończoność
+  if [[ -f "$RELAY_SEEN_FILE" ]] && (( $(wc -l <"$RELAY_SEEN_FILE") > 200 )); then
+    tail -n 100 "$RELAY_SEEN_FILE" >"$RELAY_SEEN_FILE.tmp" 2>/dev/null \
+      && mv -f "$RELAY_SEEN_FILE.tmp" "$RELAY_SEEN_FILE" 2>/dev/null || true
+  fi
 
   # [FIX-8] `relay set hostname` to stara składnia; w 2026.x jest
   # `relay set location <host>`. Próbujemy obie i NIE połykamy stderr,
@@ -410,8 +434,9 @@ run_once() {
   # od "-" (np. "--verbose build fix") był zjadany jako flaga opencode.
   args+=(-- "$prompt")
 
-  # [FIX-5] --foreground + -k: sygnał idzie do całej grupy procesów, więc
-  # sieroty (serwery MCP/LSP odpalone przez opencode) nie zostają po timeoutie.
+  # [FIX-5] --foreground trzyma opencode w naszej grupie procesów, a -k
+  # dokłada SIGKILL po KILL_GRACE sekundach od SIGTERM (goły `timeout` z 1.2.0
+  # wysyłał tylko SIGTERM do bezpośredniego dziecka).
   timeout --foreground -k "$KILL_GRACE" "$CMD_TIMEOUT" "$OC_BIN" "${args[@]}" \
     2>&1 | tee "$OUT_FILE"
   LAST_RC="${PIPESTATUS[0]}"
@@ -653,8 +678,13 @@ EOF
         timeout 10 mullvad status 2>/dev/null | head -2 | sed 's/^/       /' >&2
         local nr; nr="$(mullvad_relays | wc -l)"
         if (( nr > 0 )); then ok "relayów w puli: $nr"
-        else err "mullvad relay list zwraca 0 hostów — sprawdź login/konto"
-             problems=$(( problems + 1 )); fi
+        else
+          err "mullvad relay list zwraca 0 hostów pasujących do wzorca"
+          log "  odśwież listę:  mullvad relay update"
+          log "  sprawdź konto:   mullvad account get"
+          log "  jeśli Mullvad zmienił nazewnictwo, podmień wzorzec w mullvad_relays()"
+          problems=$(( problems + 1 ))
+        fi
       else
         err "brak mullvad"; problems=$(( problems + 1 ))
         cat >&2 <<EOF
@@ -1010,10 +1040,14 @@ esac
 #  FIX-4   Brak `--` przed promptem: `oc-rotate run "--verbose build fix"`
 #          wysyłało "--verbose build fix" jako flagi opencode.
 #  FIX-5   timeout (rc=124) wpadał do "błąd inny niż limit" i był retry'owany
-#          300x po 900s bez backoffu. Teraz osobna gałąź, limit MAX_TIMEOUTS,
-#          a `timeout --foreground -k` zabija całą grupę procesów (w 1.2.0
-#          sieroty po opencode — serwery MCP/LSP — przeżywały timeout;
-#          potwierdzone testem).
+#          300x po 900s bez backoffu. Teraz osobna gałąź + limit MAX_TIMEOUTS
+#          + backoff wykładniczy dla innych błędów (MAX_OTHER_FAILS).
+#          `timeout --foreground -k N` dochodzi SIGKILL-em i trzyma opencode
+#          w naszej grupie procesów. Uwaga: to NIE gwarantuje śmierci procesów,
+#          które same robią setsid() — testowo `sleep &` wewnątrz opencode
+#          przeżywał zarówno z --foreground, jak i bez. Gdyby to przeszkadzało,
+#          potrzebny byłby pełny nadzór grupy (setsid + kill -- -PGID) kosztem
+#          przekazywania TTY.
 #  FIX-6   log() forował `tee -a` na każdą linię i sypał "tee: ... No such
 #          file" na stdout, mieszając to z odpowiedzią modelu. Teraz jeden
 #          FD. `: > "$LOG_FILE"` kasowało historię przy każdym run.

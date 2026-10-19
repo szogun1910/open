@@ -1,2 +1,4 @@
 FAKE-OC: models
-FAKE-OC: run --model opencode/deepseek-v4-flash-free -- x
+FAKE-OC: run --model opencode/deepseek-v4-flash-free x
+FAKE-OC: run --model opencode/deepseek-v4-flash-free x
+FAKE-OC: run --model opencode/deepseek-v4-flash-free x

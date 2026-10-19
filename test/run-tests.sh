@@ -1,97 +1,159 @@
 #!/usr/bin/env bash
-# harness testowy dla oc-rotate (fake opencode/mullvad/curl)
-S="$ARENA_WORKSPACE"/oc-rotate/oc-rotate-fixed.sh
-export PATH=""$ARENA_WORKSPACE"/oc-rotate/test/home/.local/bin:"$ARENA_WORKSPACE"/oc-rotate/test/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export TESTHOME="$ARENA_WORKSPACE"/oc-rotate/test/home
-export TESTLOG=$TESTHOME/testlog IPCOUNTER=$TESTHOME/ipcount COUNTER=$TESTHOME/callcount
-export LIMIT_UNTIL=$TESTHOME/limit MODE=$TESTHOME/mode MULLVAD_STATUS=$TESTHOME/mstatus
-export HOME=$TESTHOME BIN_DIR=$TESTHOME/.local/bin
-export RUN_DIR=$TESTHOME/.config/oc-rotate/run
-clean() { rm -f "$TESTLOG" "$IPCOUNTER" "$COUNTER" "$MODE"; echo 0 > "$LIMIT_UNTIL"; }
-strip() { sed 's/\x1b\[[0-9;]*m//g'; }
-t() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
+# Harness testowy oc-rotate — podrobione `opencode`, `mullvad`, `curl`.
+#
+#   bash test/run-tests.sh                       # testuje ../oc-rotate.sh
+#   S=/sciezka/do/skryptu bash test/run-tests.sh # testuje wskazany skrypt
+#
+# Wszystko jest nadpisane na test/home/: PATH, HOME, BIN_DIR, RUN_DIR.
+# Prawdziwa konfiguracja i prawdziwy VPN nie są ruszane.
+#
+# UWAGA: wszystkie ścieżki są budowane od `pwd` (HERE), nie wpisywane literalnie.
+# W niektórych piaskownicach literały w plikach tworzonych przez narzędzia bywają
+# przepisywane na makra i skrypt "nie widzi" własnego katalogu.
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+S="${S:-$ROOT/oc-rotate.sh}"
+T="$HERE"
+
+[[ -f "$S" ]] || { echo "nie znaleziono skryptu: $S (ustaw S=...)" >&2; exit 1; }
+
+export TESTHOME="$T/home"
+export PATH="$TESTHOME/.local/bin:$T/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export TESTLOG="$TESTHOME/testlog"
+export IPCOUNTER="$TESTHOME/ipcount"
+export COUNTER="$TESTHOME/callcount"
+export LIMIT_UNTIL="$TESTHOME/limit"
+export MODE="$TESTHOME/mode"
+export MULLVAD_STATUS="$TESTHOME/mstatus"
+export HOME="$TESTHOME"
+export BIN_DIR="$TESTHOME/.local/bin"
+export RUN_DIR="$TESTHOME/.config/oc-rotate/run"
+
+mkdir -p "$BIN_DIR" "$TESTHOME/.config" "$T/bin"
 echo "Connected to se-got-wg-001" > "$MULLVAD_STATUS"
 
-t "T1 install: symlink oc-hop (FIX-1)"
-clean; rm -f "$BIN_DIR/oc-hop" "$BIN_DIR/oc-rotate" "$RUN_DIR/oc-rotate.log"
-bash $S install 2>&1 | strip | grep -E 'symlink|binarka|gotowe|problemów'
-ls -l "$BIN_DIR/oc-hop"
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+# rc musi być brany bezpośrednio po skrypcie — potok go zgubi
+cap()   { OUT=$(bash "$S" "$@" 2>&1); RC=$?; OUT=$(strip <<<"$OUT"); }
+caph()  { OUT=$(oc-hop "$@" 2>&1);    RC=$?; OUT=$(strip <<<"$OUT"); }
+clean() { rm -f "$TESTLOG" "$IPCOUNTER" "$COUNTER" "$MODE"; echo 0 > "$LIMIT_UNTIL"; }
 
-t "T1b oc-hop przez symlink działa"
-clean; oc-hop 2>&1 | strip | grep -E 'oc-hop|IP (przed|po)|gotowe'
+pass=0; fail=0; OUT=""; RC=0
+chk() { if eval "$2"; then printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1));
+        else printf '  \033[31mFAIL\033[0m %s\n       %s\n' "$1" "$(strip <<<"$OUT" | tail -2 | tr '\n' ' ')"
+             fail=$((fail+1)); fi; }
+sec() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
-t "T2 run: limit na 2 modelach -> 3. model (ścieżka podstawowa)"
-clean; echo 2 > "$LIMIT_UNTIL"
-bash $S run "napraw build" 2>&1 | strip | grep -E 'próba|SUKCES|następny model'
+# ───────────────────────── instalacja ─────────────────────────
+sec "install / symlink (FIX-1)"
+clean; rm -rf "$BIN_DIR" "$RUN_DIR"; mkdir -p "$BIN_DIR"; cap install
+chk "install rc=0"                    '[[ $RC -eq 0 ]]'
+chk "oc-hop -> oc-rotate"             '[[ "$(readlink "$BIN_DIR/oc-hop")" == "oc-rotate" ]]'
+chk "oc-hop wykonywalny"              '[[ -x "$BIN_DIR/oc-hop" ]]'
+chk "doctor: 0 problemów"             'grep -q "wszystko gotowe" <<<"$OUT"'
 
-t "T3 MAX_ROTATIONS=1 robi DOKŁADNIE 1 rotację (FIX-1 off-by-one)"
-clean; echo 99 > "$LIMIT_UNTIL"; MAX_ROTATIONS=1 MAX_ATTEMPTS=9 SETTLE=0 \
-  bash $S run "x" 2>&1 | strip | grep -E 'rotacje=|KONIEC'
+sec "hop przez symlink"
+clean; caph
+chk "oc-hop rotuje i potwierdza IP"   '[[ $RC -eq 0 ]] && grep -q "rotacja potwierdzona" <<<"$OUT"'
 
-t "T4 pusta pula modeli: czytelny błąd zamiast 'unbound variable' (FIX-2)"
-clean; cat > "$TESTHOME/.config/oc-rotate/config.sh" <<'CFG'
-VPN_BACKEND="none"
-MODELS=()
-AUTO_MODELS=0
-CFG
-bash $S run "x" 2>&1 | strip | tail -5; echo "rc=${PIPESTATUS[0]}"
-echo "-- status z pustą pulą --"; bash $S status >/dev/null 2>/tmp/st.err; echo "rc=$?"; tail -2 /tmp/st.err | strip
+# ───────────────────────── run ─────────────────────────
+sec "run: przełączanie modeli"
+clean; echo 2 > "$LIMIT_UNTIL"; cap run "napraw build"
+chk "rc=0"                            '[[ $RC -eq 0 ]]'
+chk "3. model, bez ruszania VPN"      'grep -q "SUKCES na opencode/hy3-free" <<<"$OUT" && ! grep -q "rotacja IP" <<<"$OUT"'
+
+sec "run: MAX_ROTATIONS bez off-by-one (FIX-1)"
+clean; echo 99 > "$LIMIT_UNTIL"
+MAX_ROTATIONS=1 MAX_ATTEMPTS=9 SETTLE=0 cap run x
+chk "dokładnie 1 rotacja"             'grep -q "rotacje=1)" <<<"$OUT" && ! grep -q "rotacje=2" <<<"$OUT"'
+
+sec "pusta pula modeli (FIX-2)"
+clean; printf 'VPN_BACKEND="none"\nMODELS=()\nAUTO_MODELS=0\n' > "$TESTHOME/.config/oc-rotate/config.sh"
+cap run x
+chk "rc=1 + czytelny błąd"            '[[ $RC -eq 1 ]] && grep -q "pula modeli jest pusta" <<<"$OUT"'
+chk "brak 'unbound variable'"         '! grep -q "unbound variable" <<<"$OUT"'
+bash "$S" status >/dev/null 2>/tmp/st.err; src=$?; OUT=$(cat /tmp/st.err)
+chk "status rc=0, bez crashu"         '[[ $src -eq 0 ]] && ! grep -q "unbound variable" <<<"$OUT"'
 rm -f "$TESTHOME/.config/oc-rotate/config.sh"
 
-t "T5 prompt zaczynający się od '-' (FIX-4)"
-clean; echo 0 > "$LIMIT_UNTIL"
-bash $S run "--verbose build fix" >/dev/null 2>&1
-grep -a 'FAKE-OC: run' "$TESTLOG" | tail -1
+sec "prompt zaczynający się od '-' (FIX-4)"
+clean; rm -f "$TESTLOG"; cap run "--verbose build fix"
+chk "'--verbose…' trafia po '--'"    '[[ "$(grep -a "FAKE-OC: run" "$TESTLOG" | tail -1)" == *" -- --verbose build fix" ]]'
+clean; rm -f "$TESTLOG"; cap run "-m anthropic/claude-sonnet-4"
+chk "'-m …' nie podmienia modelu"    '[[ "$(grep -a "FAKE-OC: run" "$TESTLOG" | tail -1)" == *"--model opencode/deepseek-v4-flash-free -- -m anthropic/claude-sonnet-4" ]]'
 
-t "T6 timeout: osobna gałąź + brak sierot (FIX-5)"
+sec "timeout rc=124 (FIX-5)"
 clean; echo hang > "$MODE"
-time (CMD_TIMEOUT=2 MAX_TIMEOUTS=2 MAX_ATTEMPTS=4 BACKOFF_BASE=1 \
-  bash $S run "x" 2>&1 | strip | grep -E 'timeout|za dużo|KONIEC')
+CMD_TIMEOUT=2 MAX_TIMEOUTS=2 MAX_ATTEMPTS=9 cap run x
+chk "rc=1"                            '[[ $RC -eq 1 ]]'
+chk "osobna gałąź timeout"            'grep -q "timeout po 2s (rc=124)" <<<"$OUT" && ! grep -q "błąd inny niż limit" <<<"$OUT"'
+chk "koniec po MAX_TIMEOUTS=2"        '[[ "$(grep -c "rc=124" <<<"$OUT")" -eq 2 ]]'
 
-t "T6b sieroty po timeout"
-clean; echo orphan > "$MODE"
-CMD_TIMEOUT=2 MAX_ATTEMPTS=1 bash $S run "x" >/dev/null 2>&1
-sleep 1; cp=$(cat /tmp/child.pid 2>/dev/null)
-if [ -n "$cp" ] && kill -0 "$cp" 2>/dev/null; then echo "ORPHAN ALIVE pid=$cp"; kill "$cp" 2>/dev/null; else echo "brak sierot (grupa procesów zabita)"; fi
-rm -f /tmp/child.pid
-
-t "T7 fałszywy '429' w odpowiedzi modelu przy rc=0 (FIX-3)"
-clean; echo dash429 > "$MODE"
-MAX_ATTEMPTS=3 bash $S run "x" 2>&1 | strip | grep -E 'rc=0|SUKCES|rotacja|KONIEC'
-echo "ile razy ruszono mullvada: $(grep -ac 'FAKE-MULLVAD' "$TESTLOG")"
-
-t "T8 powtarzalny błąd != limit: backoff i koniec (FIX-5)"
+sec "inny błąd: backoff i limit prób (FIX-5)"
 clean; echo fail > "$MODE"
-MAX_OTHER_FAILS=2 MAX_ATTEMPTS=5 BACKOFF_BASE=1 \
-  bash $S run "x" 2>&1 | strip | grep -E 'błąd inny|za dużo|connection reset'
+MAX_OTHER_FAILS=2 MAX_ATTEMPTS=9 BACKOFF_BASE=1 cap run x
+chk "rc=1"                            '[[ $RC -eq 1 ]]'
+chk "backoff 1s -> 2s"                'grep -q "pauza 1s" <<<"$OUT" && grep -q "pauza 2s" <<<"$OUT"'
+chk "pokazuje ogon błędu"             'grep -q "| Error: connection reset" <<<"$OUT"'
 
-t "T9 log nie jest kasowany przy każdym run (FIX-6)"
-clean; echo 0 > "$LIMIT_UNTIL"
-bash $S run "pierwszy" >/dev/null 2>&1
-bash $S run "drugi"   >/dev/null 2>&1
-echo "wpisów '=== run' w logu: $(grep -ac '=== run' "$RUN_DIR/oc-rotate.log")"
+sec "fałszywy '429' w odpowiedzi przy rc=0 (FIX-3)"
+clean; echo dash429 > "$MODE"
+MAX_ATTEMPTS=5 cap run x
+chk "rc=0 = SUKCES"                   '[[ $RC -eq 0 ]] && grep -q SUKCES <<<"$OUT"'
+chk "zero wywołań mullvada"           '! grep -aq FAKE-MULLVAD "$TESTLOG"'
 
-t "T10 relay cooldown: brak powtórek z rzędu (FIX-8)"
+sec "prawdziwy limit nadal wykrywany"
+clean; echo 1 > "$LIMIT_UNTIL"
+OC_MODELS="opencode/hy3-free" MAX_ROTATIONS=1 MAX_ATTEMPTS=3 SETTLE=0 cap run x
+chk "FreeUsageLimitError -> rotacja"  'grep -q "rotacja IP" <<<"$OUT"'
+
+sec "rotacja relayów (FIX-8)"
 clean; rm -f "$RUN_DIR/relays-used"
-for i in 1 2 3 4 5 6; do oc-hop >/dev/null 2>&1; done
-echo "wylosowane releje:"; cat "$RUN_DIR/relays-used"
+for _ in 1 2 3 4 5 6 7 8; do oc-hop >/dev/null 2>&1; done
+seq8=$(cat "$RUN_DIR/relays-used" 2>/dev/null)
+chk "8 obrotów = 8 wpisów"            '[[ "$(wc -l <<<"$seq8")" -eq 8 ]]'
+chk "brak powtórek z rzędu"           '[[ "$(awk "NR>1 && \$0==p{c++} {p=\$0} END{print c+0}" <<<"$seq8")" -eq 0 ]]'
+chk "'relay set location' (2026.x)"   'grep -aq "relay set location" "$TESTLOG"'
+chk "status sprawdzany przed IP"      'grep -aq "FAKE-MULLVAD: status" "$TESTLOG"'
 
-t "T11 niezapisywalny OUT_FILE -> twardy błąd na starcie (FIX-7)"
-clean; OUT_FILE=/nonexistent/x.out LOG_FILE=/nonexistent/x.log bash $S run "x" 2>&1 | strip | head -3
-OUT_FILE=/nonexistent/x.out LOG_FILE=/nonexistent/x.log bash $S run "x" >/dev/null 2>&1; echo "rc=$?"
+sec "pliki robocze (FIX-6, FIX-7)"
+clean; cap run pierwszy; cap run drugi
+chk "log nie kasowany per run"        '[[ "$(grep -ac "=== run" "$RUN_DIR/oc-rotate.log")" -ge 2 ]]'
+chk "RUN_DIR ma tryb 700"             '[[ "$(stat -c %a "$RUN_DIR")" == "700" ]]'
+OUT_FILE=/nonexistent/x cap run x
+chk "niezapisywalny OUT_FILE: rc=1"   '[[ $RC -eq 1 ]] && grep -q "nie mogę pisać" <<<"$OUT"'
 
-t "T12 nieznana komenda -> rc=2 (FIX-16)"
-bash $S foobar >/dev/null 2>&1; echo "rc=$?"
+sec "dispatch i help"
+bash "$S" foobar >/dev/null 2>&1; rc=$?; OUT=x
+chk "nieznana komenda rc=2"           '[[ $rc -eq 2 ]]'
+chk "version"                         '[[ "$(bash "$S" version)" == *"oc-rotate"* ]]'
+bash "$S" help >/dev/null 2>/tmp/h.txt; OUT=$(cat /tmp/h.txt)
+chk "help: nowe zmienne"              'grep -q OC_DISABLE_ROTATION <<<"$OUT" && grep -q RATE_LIMIT_RE <<<"$OUT"'
+chk "help: ostrzeżenie o ToS"         'grep -q "terms-of-service" <<<"$OUT"'
 
-t "T13 OC_DISABLE_ROTATION=1 (FIX-15)"
+sec "OC_DISABLE_ROTATION=1 (FIX-15)"
 clean; echo 99 > "$LIMIT_UNTIL"
-MAX_ATTEMPTS=5 OC_DISABLE_ROTATION=1 bash $S run "x" 2>&1 | strip | grep -E 'DISABLE|kończę|rotacja IP'
-echo "mullvad wywołany razy: $(grep -ac 'FAKE-MULLVAD' "$TESTLOG")"
+OC_DISABLE_ROTATION=1 MAX_ATTEMPTS=9 cap run x
+chk "kończy bez ruszania VPN"         'grep -q "OC_DISABLE_ROTATION=1 -> kończę" <<<"$OUT" && ! grep -aq FAKE-MULLVAD "$TESTLOG"'
 
-t "T14 stdin i plik jako prompt"
-clean; echo 0 > "$LIMIT_UNTIL"; printf 'tresc z pliku\n' > /tmp/p.txt
-bash $S run /tmp/p.txt >/dev/null 2>&1; grep -a 'FAKE-OC: run' "$TESTLOG" | tail -1
-bash $S run < /tmp/p.txt >/dev/null 2>&1; grep -a 'FAKE-OC: run' "$TESTLOG" | tail -1
+sec "prompt z pliku i ze stdin"
+clean; printf 'tresc z pliku\n' > /tmp/p.txt; rm -f "$TESTLOG"
+cap run /tmp/p.txt; a=$(grep -a 'FAKE-OC: run' "$TESTLOG" | tail -1)
+bash "$S" run < /tmp/p.txt >/dev/null 2>&1; b=$(grep -a 'FAKE-OC: run' "$TESTLOG" | tail -1); OUT="$a|$b"
+chk "z pliku"                         '[[ "$a" == *" -- tresc z pliku" ]]'
+chk "ze stdin"                        '[[ "$b" == *" -- tresc z pliku" ]]'
 
-t "T15 doctor"
-clean; bash $S doctor 2>&1 | strip | grep -E '^.*(OK|WARN|ERR)' | head -20
+sec "doctor wykrywa pętlę symlinków (regresja FIX-1)"
+ln -sfn oc-hop "$BIN_DIR/oc-hop"; cap doctor
+chk "wykrywa uszkodzony symlink"      'grep -q "uszkodzony symlink" <<<"$OUT"'
+cap install
+chk "install naprawia pętlę"          '[[ "$(readlink "$BIN_DIR/oc-hop")" == "oc-rotate" ]]'
+
+sec "models"
+clean; OUT=$(bash "$S" models --free 2>&1); RC=$?
+chk "--free filtruje"                 '[[ $RC -eq 0 ]] && [[ "$(wc -l <<<"$OUT")" -eq 3 ]]'
+
+printf '\n\033[1mPASS=%d FAIL=%d\033[0m\n' "$pass" "$fail"
+[[ $fail -eq 0 ]]

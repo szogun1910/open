@@ -13,8 +13,8 @@ case "$1" in
     fi
     case "$(cat "$MODE" 2>/dev/null)" in
       dash429) echo "Znalazlem: serwer zwrocil kod 429 w logach. Naprawione." ; exit 0;;
-      hang) echo "starting long task"; sleep 25; echo "done"; exit 0;;
-      orphan) ( sleep 25 & echo $! > /tmp/child.pid; wait ); exit 0;;
+      hang) echo "starting long task"; sleep 6; echo "done"; exit 0;;
+      orphan) sleep 6 & echo $! > /tmp/child.pid; trap "kill $! 2>/dev/null" TERM INT; wait; exit 0;;
       fail) echo "Error: connection reset by peer"; exit 1;;
     esac
     echo "ANSWER OK on attempt $n with: $*"; exit 0
